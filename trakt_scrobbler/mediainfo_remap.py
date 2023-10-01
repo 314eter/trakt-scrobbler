@@ -9,13 +9,23 @@ import sys
 from copy import deepcopy
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
-from pydantic import BaseModel, Extra, Field, root_validator, validator
+from pydantic import (
+    field_validator,
+    model_validator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    GetCoreSchemaHandler,
+    GetJsonSchemaHandler,
+)
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema, CoreSchema
 from trakt_scrobbler import logger
 from trakt_scrobbler.app_dirs import CFG_DIR
 
@@ -49,16 +59,22 @@ class NumOrRange:
         return NumOrRange(self.start + delta, self.end + delta)
 
     @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
+    def __get_pydantic_core_schema__(
+        cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(cls.validate, handler(str))
 
     @classmethod
-    def __modify_schema__(cls, field_schema):
-        # this class is a union of int and string "(\d+(:\d+)?)"
-        field_schema['type'] = {
+    def __get_pydantic_json_schema__(
+        cls, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        json_schema = handler(core_schema)
+        json_schema = handler.resolve_ref_schema(json_schema)
+        json_schema['type'] = {
             "anyOf": [{"pattern": "^[0-9]+(:[0-9]+)?$"}, {"type": "integer"}]
         }
-        field_schema['examples'] = ["1", "2:4"]
+        json_schema['examples'] = ["1", "2:4"]
+        return json_schema
 
     @classmethod
     def validate(cls, v):
@@ -85,20 +101,21 @@ class NumOrRange:
 
 
 class RemapMatch(BaseModel):
-    path: Optional[re.Pattern]
-    episode: Optional[NumOrRange]
-    season: Optional[NumOrRange]
-    title: Optional[str]
-    year: Optional[int]
+    path: Optional[re.Pattern] = None
+    episode: Optional[NumOrRange] = None
+    season: Optional[NumOrRange] = None
+    title: Optional[str] = None
+    year: Optional[int] = None
 
-    @root_validator
+    @model_validator(mode="before")
     def check_atleast_one(cls, values):
         assert any(
             values.get(k) is not None for k in ("path", "title")
         ), f"Expected either path or title in match. Got {values}"
         return values
 
-    @validator('path')
+    @field_validator('path')
+    @classmethod
     def path_regex(cls, path):
         if isinstance(path, str):
             return re.compile(path)
@@ -193,15 +210,17 @@ class MediaType(str, Enum):
         return "episode" if self == MediaType.episode else "movie"
 
 
-class RemapRule(BaseModel, extra=Extra.forbid):
+class RemapRule(BaseModel):
     match: RemapMatch
     media_type: MediaType = Field(alias="type")
     media_id: MediaId = Field(alias="id")
-    season: Optional[int]
-    episode: Optional[NumOrRange]
+    season: Optional[int] = None
+    episode: Optional[NumOrRange] = None
     episode_delta: int = 0
 
-    @root_validator
+    model_config = ConfigDict(extra='forbid')
+
+    @model_validator(mode="before")
     def check_no_ep_with_movie(cls, values):
         if values.get("media_type") == MediaType.movie:
             assert values.get("season") is None, "Got season in movie rule"
